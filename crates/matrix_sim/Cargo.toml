@@ -1,0 +1,12 @@
+[package]
+name = "matrix_sim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+matrix_core = { workspace = true }
+matrix_physics = { workspace = true }
+matrix_gpu = { workspace = true }
+bevy = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
