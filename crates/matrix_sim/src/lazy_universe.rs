@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use matrix_core::*;
-use matrix_physics::{cosmology, procgen};
+use matrix_physics::{cosmology, particle, procgen};
 use rand::SeedableRng;
 
 /// The LazyUniverse manages the region-based simulation.
@@ -30,9 +30,32 @@ pub struct LazyUniverse {
     pub lod_frame: u32,
     /// Incremented each time loaded_stars changes (cosmos renderer uses this)
     pub stars_generation: u32,
+    /// Particles currently loaded for the active region
+    pub loaded_particles: Vec<matrix_core::GpuParticle>,
+    /// Incremented each time loaded_particles changes (particle renderer uses this)
+    pub particles_generation: u32,
 }
 
 impl LazyUniverse {
+    /// Placeholder with no regions (used before world generation completes)
+    pub fn empty(config: SimConfig) -> Self {
+        Self {
+            regions: Vec::new(),
+            loaded_stars: Vec::new(),
+            camera_pos: [0.0; 3],
+            current_region_id: None,
+            life_planets: Vec::new(),
+            civilization_count: 0,
+            config,
+            last_stats_age: 0.0,
+            last_reload_age: 0.0,
+            lod_frame: 0,
+            stars_generation: 0,
+            loaded_particles: Vec::new(),
+            particles_generation: 0,
+        }
+    }
+
     pub fn new(config: SimConfig, age_gyr: f64) -> Self {
         let regions = procgen::generate_regions(&config, age_gyr);
 
@@ -48,6 +71,8 @@ impl LazyUniverse {
             last_reload_age: age_gyr,
             lod_frame: 0,
             stars_generation: 0,
+            loaded_particles: Vec::new(),
+            particles_generation: 0,
         }
     }
 
@@ -177,6 +202,15 @@ impl LazyUniverse {
 
             self.loaded_stars = stars;
             self.stars_generation = self.stars_generation.wrapping_add(1);
+
+            // Generate particles for this region
+            self.loaded_particles = particle::generate_region_particles(region, age_gyr);
+            self.particles_generation = self.particles_generation.wrapping_add(1);
+            info!(
+                "Loaded {} particles for region {}",
+                self.loaded_particles.len(),
+                region_id
+            );
         }
     }
 

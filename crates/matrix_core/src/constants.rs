@@ -29,5 +29,11 @@ pub const DT: f32 = 0.001;
 /// Barnes-Hut opening angle (theta)
 pub const BH_THETA: f32 = 0.5;
 
+/// Near-field neighbor count for hybrid gravity (butterfly effect)
+pub const NEAR_FIELD_K: usize = 32;
+
+/// Near-field softening (much smaller than grid softening for fine-grained interactions)
+pub const NEAR_FIELD_SOFTENING: f32 = 0.01;
+
 /// Workgroup size for GPU compute shaders
 pub const WORKGROUP_SIZE: u32 = 256;
