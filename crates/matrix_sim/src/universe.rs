@@ -1,5 +1,7 @@
 use bevy::prelude::*;
+use matrix_core::constants::NEAR_FIELD_K;
 use matrix_core::{GpuParticle, SimConfig, UniversePhase, MAX_ENTROPY};
+use matrix_physics::forces::{near_field_gravity, SpatialHash};
 use matrix_physics::spacetime;
 use matrix_physics::thermodynamics;
 
@@ -30,10 +32,20 @@ pub struct UniverseState {
     pub gravity_frame: u32,
     /// Whether particle gravity should be computed (set by render based on camera distance)
     pub particles_active: bool,
+    /// Cached alive particle count (updated periodically, not every frame)
+    pub cached_alive_count: usize,
+    /// Incremented when particles are replaced by lazy loading (render uses this)
+    pub particles_generation: u32,
 }
 
 impl UniverseState {
+    /// Placeholder with no particles (used before world generation completes)
+    pub fn empty(config: SimConfig) -> Self {
+        Self::new(config, Vec::new())
+    }
+
     pub fn new(config: SimConfig, particles: Vec<GpuParticle>) -> Self {
+        let count = particles.len();
         Self {
             age: 0.0,
             scale_factor: 1.0,
@@ -47,6 +59,8 @@ impl UniverseState {
             config,
             gravity_frame: 0,
             particles_active: true,
+            cached_alive_count: count,
+            particles_generation: 0,
         }
     }
 
@@ -61,8 +75,8 @@ impl UniverseState {
 
         self.gravity_frame = self.gravity_frame.wrapping_add(1);
 
-        // Throttle gravity: at high time scales, skip most frames
-        // time_scale 1 → every frame, 100 → every 5th, 10K+ → every 30th, 1M+ → every 120th
+        // Throttle gravity: hybrid gravity is heavy (~400M ops)
+        // Even at time_scale 1, run every 3rd frame for smooth 60fps
         let gravity_interval = if self.time_scale >= 1_000_000.0 {
             120
         } else if self.time_scale >= 10_000.0 {
@@ -70,7 +84,7 @@ impl UniverseState {
         } else if self.time_scale >= 100.0 {
             5
         } else {
-            1
+            3
         };
 
         let run_gravity = self.particles_active && (self.gravity_frame % gravity_interval == 0);
@@ -84,22 +98,41 @@ impl UniverseState {
         self.scale_factor =
             spacetime::expand_scale_factor(self.scale_factor, hubble, effective_dt);
 
-        // Thermodynamics: only every 30 frames (it iterates all particles)
+        // Thermodynamics + alive count: every 30 frames
         if self.gravity_frame % 30 == 0 {
-            self.total_entropy = thermodynamics::calculate_entropy(&self.particles);
-            self.temperature = thermodynamics::average_temperature(&self.particles);
+            let (entropy, temp) =
+                thermodynamics::calculate_entropy_and_temperature(&self.particles);
+            self.total_entropy = entropy;
+            self.temperature = temp;
+            self.cached_alive_count = self.particles.iter().filter(|p| p.is_alive()).count();
+        }
+
+        // Compact: remove dead particles every 100 frames
+        if self.gravity_frame % 100 == 0 {
+            self.compact_particles();
         }
 
         // Phase transitions
         self.update_phase();
     }
 
-    /// Heavy particle simulation: grid gravity + integration
+    /// Remove dead particles from the array to reduce iteration cost
+    fn compact_particles(&mut self) {
+        let before = self.particles.len();
+        self.particles.retain(|p| p.is_alive());
+        let after = self.particles.len();
+        if before != after {
+            info!("Compacted particles: {} → {} (removed {})", before, after, before - after);
+        }
+    }
+
+    /// Heavy particle simulation: hybrid gravity (near-field direct + far-field grid) + integration
     fn tick_particles(&mut self, effective_dt: f64) {
         let sim_dt = effective_dt as f32 * 0.1;
         let hubble = spacetime::hubble_parameter(self.age, self.phase) as f32;
+        let gravity_strength = self.config.gravity_scale * 0.5;
 
-        // --- Grid-based gravity approximation (O(n) instead of O(n^2)) ---
+        // --- Far-field: grid-based gravity approximation ---
         let grid_size: i32 = 16;
         let total_cells = (grid_size * grid_size * grid_size) as usize;
 
@@ -153,20 +186,63 @@ impl UniverseState {
             }
         }
 
-        let gravity_strength = self.config.gravity_scale * 0.5;
+        // --- Near-field: spatial hash for K-nearest neighbor direct gravity ---
+        // Cell size chosen so average cell has ~24 particles (for ~100K alive)
+        let alive_count = self.particles.iter().filter(|p| p.is_alive()).count();
+        let spatial_cell_size = if alive_count > 0 {
+            let avg_range = (bb_range[0] + bb_range[1] + bb_range[2]) / 3.0;
+            // Target ~24 particles per cell: cells³ ≈ alive/24
+            let cells_per_dim = ((alive_count as f32 / 24.0).cbrt()).max(1.0);
+            avg_range / cells_per_dim
+        } else {
+            1.0
+        };
+        let spatial_hash = SpatialHash::build(&self.particles, spatial_cell_size);
+
+        // --- Pre-compute near-field neighbor lists ---
+        // (need immutable borrow for particles, then mutable for updates)
+        let neighbor_lists: Vec<(usize, Vec<usize>, [f32; 3])> = self
+            .particles
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.is_alive())
+            .map(|(i, p)| {
+                let pos = p.pos();
+                let neighbors =
+                    spatial_hash.nearest_neighbors(pos, i, &self.particles, NEAR_FIELD_K);
+                (i, neighbors, pos)
+            })
+            .collect();
+
+        // Pre-compute near-field accelerations
+        let near_accels: Vec<(usize, [f32; 3])> = neighbor_lists
+            .iter()
+            .map(|(i, neighbors, pos)| {
+                let acc = near_field_gravity(*pos, neighbors, &self.particles, gravity_strength);
+                (*i, acc)
+            })
+            .collect();
+
         let softening = 0.5f32;
 
-        // --- Update each particle ---
-        for p in self.particles.iter_mut() {
+        // --- Update each particle with combined near + far gravity ---
+        // Build a map from particle index to near-field acceleration
+        let mut near_acc_map = vec![[0.0f32; 3]; self.particles.len()];
+        for (idx, acc) in near_accels {
+            near_acc_map[idx] = acc;
+        }
+
+        for (pi, p) in self.particles.iter_mut().enumerate() {
             if !p.is_alive() {
                 continue;
             }
 
-            // Gravity: interact with all grid cell centers-of-mass
-            let mut ax = 0.0f32;
-            let mut ay = 0.0f32;
-            let mut az = 0.0f32;
+            // Near-field: direct gravity from K nearest (butterfly effect)
+            let mut ax = near_acc_map[pi][0];
+            let mut ay = near_acc_map[pi][1];
+            let mut az = near_acc_map[pi][2];
 
+            // Far-field: grid cell centers-of-mass
             for ci in 0..total_cells {
                 if cell_mass[ci] < 0.001 {
                     continue;
@@ -243,14 +319,21 @@ impl UniverseState {
         }
     }
 
+    /// Replace particle vec with new data (lazy loading)
+    pub fn replace_particles(&mut self, particles: Vec<GpuParticle>) {
+        self.cached_alive_count = particles.len();
+        self.particles = particles;
+        self.particles_generation = self.particles_generation.wrapping_add(1);
+    }
+
     /// Get the current Hubble parameter
     pub fn hubble(&self) -> f64 {
         spacetime::hubble_parameter(self.age, self.phase)
     }
 
-    /// Particle count (alive)
+    /// Particle count (alive) — returns cached value, updated every 30 frames
     pub fn alive_count(&self) -> usize {
-        self.particles.iter().filter(|p| p.is_alive()).count()
+        self.cached_alive_count
     }
 
     /// Find the center of the densest particle cluster using grid-based density estimation

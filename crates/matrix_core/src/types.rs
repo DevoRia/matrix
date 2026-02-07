@@ -49,6 +49,41 @@ impl GpuParticle {
     }
 }
 
+/// Serializable version of GpuParticle (GpuParticle uses Pod which prevents Serialize)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializedParticle {
+    pub position: [f32; 4],
+    pub velocity: [f32; 4],
+    pub kind: u32,
+    pub flags: u32,
+    pub temperature: f32,
+}
+
+impl From<&GpuParticle> for SerializedParticle {
+    fn from(p: &GpuParticle) -> Self {
+        Self {
+            position: p.position,
+            velocity: p.velocity,
+            kind: p.kind,
+            flags: p.flags,
+            temperature: p.temperature,
+        }
+    }
+}
+
+impl From<&SerializedParticle> for GpuParticle {
+    fn from(p: &SerializedParticle) -> Self {
+        Self {
+            position: p.position,
+            velocity: p.velocity,
+            kind: p.kind,
+            flags: p.flags,
+            temperature: p.temperature,
+            _pad: 0.0,
+        }
+    }
+}
+
 /// Types of particles in the simulation
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

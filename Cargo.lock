@@ -2711,6 +2711,9 @@ dependencies = [
  "matrix_core",
  "matrix_physics",
  "matrix_sim",
+ "matrix_storage",
+ "rand",
+ "rand_chacha",
 ]
 
 [[package]]
